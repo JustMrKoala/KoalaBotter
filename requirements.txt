@@ -1,1 +1,2 @@
 aiohttp>=3.9.0
+cloudscraper>=1.2.71

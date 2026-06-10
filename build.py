@@ -65,7 +65,9 @@ def main():
         # Windows uses ; separator for --add-data
         spec.append(f"--add-data={ASSETS_DIR}{';'}{ASSETS_DIR.name}")
 
-    # Entry point
+    for hidden in ("cloudscraper", "requests", "requests_toolbelt", "pyparsing"):
+        spec.append(f"--hidden-import={hidden}")
+
     spec.append(str(ROOT / "main.py"))
 
     print("\n=== Building KoalaBot (release onefile) ===\n")
