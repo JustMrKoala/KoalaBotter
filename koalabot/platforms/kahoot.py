@@ -1,8 +1,3 @@
-"""Kahoot bot spawner - async, high performance, pure Python (aiohttp).
-
-Protocol based on public reverse engineering (reserve/session + cometd over WS + challenge solve).
-"""
-
 from __future__ import annotations
 import asyncio
 import json
@@ -10,16 +5,16 @@ import random
 import re
 import time
 from base64 import b64decode
-from typing import List
+from typing import List, Any, Optional
 
 import aiohttp
 
-from ..core import PlayerStatus, MAX_BOTS
+from ..core import PlayerStatus
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/129.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 KAHOOT_HEADERS = {
@@ -29,62 +24,86 @@ KAHOOT_HEADERS = {
     "Referer": "https://kahoot.it/",
 }
 
-# Bayeux / CometD style for Kahoot
-HANDSHAKE = {
-    "version": "1.0",
-    "minimumVersion": "1.0",
-    "channel": "/meta/handshake",
-    "supportedConnectionTypes": ["websocket", "long-polling"],
-    "advice": {"timeout": 60000, "interval": 0},
-}
 
 def _solve_challenge(session_token: str, challenge_text: str) -> str:
-    """Pure-Python challenge solver (ported/adapted from known working implementations)."""
-    try:
-        text = challenge_text.replace("\t", " ").encode("ascii", "ignore").decode("utf-8")
-        # Try to extract offset safely
+    text = challenge_text.replace("\t", " ")
+    encoded = ""
+    offset = 0
+
+    m_decode = re.search(r"decode\.call\(this,\s*'([a-zA-Z0-9]+)'\)", text)
+    m_offset = re.search(r"var offset\s*=\s*([()+*\s\t0-9]+);", text)
+    if m_decode and m_offset:
+        encoded = m_decode.group(1)
+        offset = int(eval(m_offset.group(1)))
+    else:
         m = re.search(r"offset\s*=\s*([0-9]+)", text)
         if m:
             offset = int(m.group(1))
         else:
-            # Fallback: eval the small expression (server controlled, small risk)
-            offset = int(eval(text.split("offset = ")[1].split(";")[0]))  # nosec - controlled input shape
-
-        # Extract the input string passed to the decoder
+            try:
+                offset = int(eval(text.split("offset = ")[1].split(";")[0]))
+            except Exception:
+                return ""
         m2 = re.search(r"this,\s*['\"]([^'\"]+)['\"]", text)
         if m2:
             encoded = m2.group(1)
         else:
-            # Original style fallback
-            encoded = text.split("this, '")[1].split("'")[0]
+            try:
+                encoded = text.split("this, '")[1].split("'")[0]
+            except Exception:
+                return ""
 
-        # decode(offset, input)
-        decoded = ""
-        for pos, ch in enumerate(encoded):
-            decoded += chr(((ord(ch) * pos) + offset) % 77 + 48)
+    decoded = ""
+    for pos, ch in enumerate(encoded):
+        decoded += chr(((ord(ch) * pos) + offset) % 77 + 48)
 
-        # XOR with base64-decoded session token
-        token_bytes = b64decode(session_token)
-        sol_chars = [ord(c) for c in decoded]
-        tok_chars = list(token_bytes)
-        result = bytes(tok_chars[i] ^ sol_chars[i % len(sol_chars)] for i in range(len(tok_chars)))
-        return result.decode("utf-8", errors="replace")
+    try:
+        token_str = b64decode(session_token).decode("utf-8")
     except Exception:
-        # Last resort: return empty so join will likely fail fast
         return ""
+
+    result = ""
+    for i in range(len(token_str)):
+        result += chr(ord(token_str[i]) ^ ord(decoded[i % len(decoded)]))
+    return result
+
+
+def _parse_ws_payload(raw: str) -> List[dict]:
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        return [data]
+    return []
+
 
 async def _kahoot_bot(
     session: aiohttp.ClientSession,
     pin: str,
     name: str,
     stop_event: asyncio.Event,
-    update_cb,  # callable(status: PlayerStatus)
+    update_cb,
 ) -> PlayerStatus:
     status = PlayerStatus(name=name, platform="kahoot", status="joining")
     update_cb(status)
 
+    ws: Optional[aiohttp.ClientWebSocketResponse] = None
+    msg_id = 0
+
+    def next_id() -> str:
+        nonlocal msg_id
+        msg_id += 1
+        return str(msg_id)
+
+    async def send_msg(ws_conn: aiohttp.ClientWebSocketResponse, payload: dict) -> None:
+        payload = dict(payload)
+        payload["id"] = payload.get("id") or next_id()
+        await ws_conn.send_str(json.dumps([payload]))
+
     try:
-        # 1. Reserve session
         ts = int(time.time() * 1000)
         reserve_url = f"https://kahoot.it/reserve/session/{pin}/?{ts}"
         async with session.get(reserve_url, headers=KAHOOT_HEADERS, timeout=aiohttp.ClientTimeout(total=12)) as resp:
@@ -110,41 +129,72 @@ async def _kahoot_bot(
             update_cb(status)
             return status
 
-        # 2. Connect WS
-        ws_url = f"wss://play.kahoot.it/cometd/{pin}/{session_id}"
+        ws_url = f"wss://kahoot.it/cometd/{pin}/{session_id}"
         ws = await session.ws_connect(ws_url, headers={"User-Agent": USER_AGENT}, timeout=12)
 
-        # Handshake
-        await ws.send_json({**HANDSHAKE, "id": "1"})
-        msg = await ws.receive_json(timeout=8)
-        client_id = msg.get("clientId")
+        await send_msg(ws, {
+            "version": "1.0",
+            "minimumVersion": "1.0",
+            "channel": "/meta/handshake",
+            "supportedConnectionTypes": ["websocket", "long-polling", "callback-polling"],
+            "advice": {"timeout": 60000, "interval": 0},
+            "ext": {
+                "ack": True,
+                "timesync": {"tc": int(time.time() * 1000), "l": 0, "o": 0},
+            },
+        })
+
+        client_id: Optional[str] = None
+        ack = 0
+        namerator_sent = False
+        answered_questions = 0
+        handshake_deadline = time.time() + 12
+
+        while client_id is None and time.time() < handshake_deadline:
+            try:
+                msg = await asyncio.wait_for(ws.receive(), timeout=2)
+            except asyncio.TimeoutError:
+                continue
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                continue
+            for packet in _parse_ws_payload(msg.data):
+                if packet.get("channel") == "/meta/handshake" and packet.get("clientId"):
+                    client_id = packet["clientId"]
+                    break
+                if packet.get("error"):
+                    status.status = "failed"
+                    status.error = str(packet.get("error"))[:120]
+                    update_cb(status)
+                    await ws.close()
+                    return status
+
         if not client_id:
-            await ws.close()
             status.status = "failed"
             status.error = "handshake no clientId"
             update_cb(status)
+            await ws.close()
             return status
 
-        # Connect
-        await ws.send_json({
+        await send_msg(ws, {
             "channel": "/meta/connect",
             "clientId": client_id,
             "connectionType": "websocket",
-            "id": "2",
             "advice": {"timeout": 0},
+            "ext": {
+                "ack": ack,
+                "timesync": {"tc": int(time.time() * 1000), "l": 262, "o": -14},
+            },
         })
+        ack += 1
 
-        # Subscribe channels (controller, player, status)
         for ch in ("/service/controller", "/service/player", "/service/status"):
-            await ws.send_json({
+            await send_msg(ws, {
                 "channel": "/meta/subscribe",
                 "clientId": client_id,
                 "subscription": ch,
-                "id": str(random.randint(10, 99)),
             })
 
-        # Login / join
-        login_msg = {
+        await send_msg(ws, {
             "channel": "/service/controller",
             "clientId": client_id,
             "data": {
@@ -157,21 +207,9 @@ async def _kahoot_bot(
                         "userAgent": USER_AGENT,
                         "screen": {"width": 1920, "height": 1080},
                     },
-                    "usingNamerator": False,
                 }),
             },
-            "id": "3",
-        }
-        await ws.send_json(login_msg)
-
-        status.joined = True
-        status.status = "joined"
-        status.last_action = "joined lobby"
-        update_cb(status)
-
-        # Main receive loop - answer questions randomly, count answers
-        answer_choices = [0, 1, 2, 3]
-        answered_questions = 0
+        })
 
         while not stop_event.is_set():
             try:
@@ -179,42 +217,90 @@ async def _kahoot_bot(
             except asyncio.TimeoutError:
                 if stop_event.is_set():
                     break
-                # send lightweight connect to keep alive
                 try:
-                    await ws.send_json({
+                    await send_msg(ws, {
                         "channel": "/meta/connect",
                         "clientId": client_id,
                         "connectionType": "websocket",
-                        "id": str(random.randint(100, 999)),
+                        "ext": {
+                            "ack": ack,
+                            "timesync": {"tc": int(time.time() * 1000), "l": 262, "o": -14},
+                        },
                     })
+                    ack += 1
                 except Exception:
                     break
                 continue
 
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except Exception:
-                    continue
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                    break
+                continue
 
-                # Detect question start (various shapes seen in wild)
-                content = data.get("data") or data.get("content") or {}
-                if isinstance(content, str):
+            for packet in _parse_ws_payload(msg.data):
+                if packet.get("error"):
+                    if not status.joined:
+                        status.status = "failed"
+                        status.error = str(packet.get("error"))[:120]
+                        update_cb(status)
+                        await ws.close()
+                        return status
+                    break
+
+                channel = packet.get("channel", "")
+                data = packet.get("data") or {}
+
+                if channel == "/meta/connect":
                     try:
-                        content = json.loads(content)
+                        await send_msg(ws, {
+                            "channel": "/meta/connect",
+                            "clientId": client_id,
+                            "connectionType": "websocket",
+                            "ext": {
+                                "ack": ack,
+                                "timesync": {"tc": int(time.time() * 1000), "l": 262, "o": -14},
+                            },
+                        })
+                        ack += 1
+                    except Exception:
+                        pass
+
+                if channel == "/service/controller":
+                    ctrl_type = data.get("type") if isinstance(data, dict) else None
+                    if ctrl_type == "loginResponse" and not namerator_sent:
+                        status.joined = True
+                        status.status = "joined"
+                        status.last_action = "joined lobby"
+                        update_cb(status)
+                        await send_msg(ws, {
+                            "channel": "/service/controller",
+                            "clientId": client_id,
+                            "data": {
+                                "gameid": pin,
+                                "type": "message",
+                                "host": "kahoot.it",
+                                "id": 4,
+                                "content": json.dumps({"usingNamerator": False}),
+                            },
+                        })
+                        namerator_sent = True
+
+                content_raw = data.get("content") if isinstance(data, dict) else None
+                content: Any = {}
+                if isinstance(content_raw, str):
+                    try:
+                        content = json.loads(content_raw)
                     except Exception:
                         content = {}
+                elif isinstance(content_raw, dict):
+                    content = content_raw
 
-                msg_type = data.get("msgType") or data.get("type") or ""
-                # Common patterns for question ready / start
-                if "question" in str(msg_type).lower() or "START_QUESTION" in str(data) or content.get("type") == "quiz":
-                    # Random answer after small realistic delay
-                    choice = random.choice(answer_choices)
-                    delay = random.uniform(1.2, 4.5)
-                    await asyncio.sleep(delay)
-
+                msg_id_num = data.get("id") if isinstance(data, dict) else None
+                if msg_id_num == 2 or (isinstance(content, dict) and "questionIndex" in content):
+                    choice = random.randint(0, 3)
+                    await asyncio.sleep(random.uniform(1.2, 4.5))
                     try:
-                        answer_payload = {
+                        await send_msg(ws, {
                             "channel": "/service/controller",
                             "clientId": client_id,
                             "data": {
@@ -226,55 +312,61 @@ async def _kahoot_bot(
                                     "choice": choice,
                                     "meta": {
                                         "lag": random.randint(10, 120),
-                                        "device": {"userAgent": USER_AGENT, "screen": {"width": 1920, "height": 1080}},
+                                        "device": {
+                                            "userAgent": USER_AGENT,
+                                            "screen": {"width": 1920, "height": 1080},
+                                        },
                                     },
                                 }),
                             },
-                            "id": str(random.randint(1000, 9999)),
-                        }
-                        await ws.send_json(answer_payload)
+                        })
                         answered_questions += 1
                         status.answers = answered_questions
+                        status.status = "answering"
                         status.last_action = f"answered Q{answered_questions}"
                         update_cb(status)
                     except Exception:
                         pass
 
-                if any(x in str(data) for x in ("GAME_OVER", "RESET_CONTROLLER", "game over", "end")):
+                if msg_id_num in (3, 10) or any(
+                    x in json.dumps(packet).lower() for x in ("game_over", "reset_controller", "game over")
+                ):
                     status.status = "completed"
                     status.last_action = "game ended"
                     update_cb(status)
                     break
 
-            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+            if status.status == "completed":
                 break
 
         if status.status not in ("completed", "failed"):
-            status.status = "completed"
-            status.last_action = "disconnected after game"
-        await ws.close()
+            status.status = "completed" if status.joined else "failed"
+            if status.joined:
+                status.last_action = "disconnected after game"
+        if ws:
+            await ws.close()
 
     except asyncio.CancelledError:
         status.status = "completed"
         raise
     except Exception as e:
-        status.joined = status.joined  # keep whatever we achieved
         status.status = "failed" if not status.joined else "completed"
         status.error = str(e)[:120]
         status.last_action = "error"
         update_cb(status)
     finally:
+        if ws and not ws.closed:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         update_cb(status)
 
     return status
 
-async def spawn_kahoot_bots(pin: str, names: List[str], join_delay_ms: int = 150) -> List[PlayerStatus]:
-    """Spawn many Kahoot bots concurrently with small stagger."""
-    pin = str(pin).strip()
-    if not pin or not pin.isdigit():
-        # still try; some pins have letters in special modes but rare
-        pass
 
+async def spawn_kahoot_bots(pin: str, names: List[str], join_delay_ms: int = 150) -> List[PlayerStatus]:
+    pin = str(pin).strip()
     results: List[PlayerStatus] = [PlayerStatus(name=n) for n in names]
     stop_event = asyncio.Event()
 
@@ -284,9 +376,8 @@ async def spawn_kahoot_bots(pin: str, names: List[str], join_delay_ms: int = 150
         tasks = []
 
         async def _wrapped(i: int, nm: str):
-            # small stagger to be nice to servers and look more human
             await asyncio.sleep(min(0.04 * (i % 25), 1.5))
-            ps = await _kahoot_bot(session, pin, nm, stop_event, lambda s: None)  # update inside runner
+            ps = await _kahoot_bot(session, pin, nm, stop_event, lambda s: None)
             results[i] = ps
             return ps
 
@@ -296,12 +387,6 @@ async def spawn_kahoot_bots(pin: str, names: List[str], join_delay_ms: int = 150
                 await _wrapped(i, n)
             tasks.append(asyncio.create_task(_run()))
 
-        # We return control to caller who will drive updates via a different mechanism
-        # Actually we want live updates. Better: pass a callback that the GUI runner will provide.
-        # For direct use, we still run them.
-
-        # Simpler: run with a queue or just gather and let outer code poll (we'll use live callback in runner)
-        # Here we just await them all for the library-style call.
         await asyncio.gather(*tasks, return_exceptions=True)
         stop_event.set()
 

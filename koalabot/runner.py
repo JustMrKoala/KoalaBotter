@@ -139,10 +139,7 @@ async def run_live(
         tasks.append(asyncio.create_task(launch_one(i, nm)))
 
     # Wait for completion or external stop
-    try:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    finally:
-        stop_event.set()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
     summary = make_summary(results)
     on_log(f"Finished. Joined: {summary['joined']}/{summary['attempted']}  |  Answers sent: {summary['totalAnswers']}")

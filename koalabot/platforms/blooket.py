@@ -1,14 +1,3 @@
-"""Blooket bot spawner - closer port of the original implementation.
-
-Original uses:
-- PUT https://api.blooket.com/api/firebase/join → fbToken
-- Google verifyCustomToken → idToken
-- Probe/discover Firebase WS shard (or fallback)
-- Send Firebase wire protocol messages (t:'d' style) for auth + player data + answers
-- Random blook on join
-- Detect questions and game end from realtime payloads
-"""
-
 from __future__ import annotations
 import asyncio
 import json
@@ -23,7 +12,7 @@ from ..core import PlayerStatus
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/129.0.0.0 Safari/537.36"
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
 BLOOKET = {
@@ -32,34 +21,107 @@ BLOOKET = {
     "checkPin": lambda pin: f"https://api.blooket.com/api/firebase/id?id={pin}",
 }
 
-# From original
 SERVER_CODES = [
     1476, 2018, 2025, 2037, 1570, 2520, 2050, 522, 1402, 2034,
     1444, 1755, 1758, 1757, 1756, 1751, 1755,
 ]
 
 BLOOKS = [
-    'Chick', 'Chicken', 'Cow', 'Goat', 'Horse', 'Pig', 'Sheep', 'Duck', 'Dog', 'Cat',
-    'Rabbit', 'Goldfish', 'Hamster', 'Turtle', 'Kitten', 'Puppy', 'Bear', 'Moose', 'Fox',
+    "Chick", "Chicken", "Cow", "Goat", "Horse", "Pig", "Sheep", "Duck", "Dog", "Cat",
+    "Rabbit", "Goldfish", "Hamster", "Turtle", "Kitten", "Puppy", "Bear", "Moose", "Fox",
 ]
+
+_scraper = None
+
+
+def _get_scraper():
+    global _scraper
+    if _scraper is None:
+        import cloudscraper
+        _scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "desktop": True}
+        )
+    return _scraper
+
+
+def _http_ok(status: int) -> bool:
+    return 200 <= status < 300
+
 
 def random_blook() -> str:
     return random.choice(BLOOKS)
 
+
 def _authorize_message(token: str) -> str:
     return json.dumps({"t": "d", "d": {"r": 1, "a": "auth", "b": {"cred": token}}})
+
 
 def _join_message(pin: str, name: str, blook: str) -> str:
     return json.dumps({
         "t": "d",
-        "d": {"r": 2, "a": "p", "b": {"p": f"/{pin}/c/{name}", "d": {"b": blook}}}
+        "d": {"r": 2, "a": "p", "b": {"p": f"/{pin}/c/{name}", "d": {"b": blook}}},
     })
+
 
 def _answer_message(pin: str, name: str, choice: int, req_id: int) -> str:
     return json.dumps({
         "t": "d",
-        "d": {"r": req_id, "a": "p", "b": {"p": f"/{pin}/c/{name}", "d": {"c": choice}}}
+        "d": {"r": req_id, "a": "p", "b": {"p": f"/{pin}/c/{name}", "d": {"c": choice}}},
     })
+
+
+def _get_auth_token_sync(pin: str, name: str) -> str:
+    scraper = _get_scraper()
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+        "Referer": "https://www.blooket.com/",
+        "Origin": "https://www.blooket.com",
+    }
+
+    check_url = BLOOKET["checkPin"](pin)
+    r = scraper.get(check_url, headers=headers, timeout=12)
+    if not _http_ok(r.status_code):
+        raise RuntimeError(f"Game check failed ({r.status_code})")
+    try:
+        alive = r.json()
+    except Exception:
+        raise RuntimeError("Game check blocked or invalid response")
+    if not alive.get("success"):
+        raise RuntimeError(alive.get("msg") or "Game not found or not active")
+
+    r = scraper.put(
+        BLOOKET["join"],
+        json={"id": pin, "name": name},
+        headers=headers,
+        timeout=12,
+    )
+    if not _http_ok(r.status_code):
+        raise RuntimeError(f"Join failed ({r.status_code})")
+    try:
+        join_res = r.json()
+    except Exception:
+        raise RuntimeError("Join response blocked or invalid")
+    if not join_res.get("fbToken"):
+        raise RuntimeError(join_res.get("msg") or "Failed to join game")
+
+    r = scraper.post(
+        BLOOKET["verify"],
+        json={"returnSecureToken": True, "token": join_res["fbToken"]},
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        timeout=12,
+    )
+    if not _http_ok(r.status_code):
+        raise RuntimeError(f"Token verify failed ({r.status_code})")
+    verify_res = r.json()
+    if not verify_res.get("idToken"):
+        raise RuntimeError("Failed to verify Blooket token")
+    return verify_res["idToken"]
+
+
+async def _get_auth_token(pin: str, name: str) -> str:
+    return await asyncio.to_thread(_get_auth_token_sync, pin, name)
+
 
 async def _find_socket_url(session: aiohttp.ClientSession, server_code: int) -> str:
     fallback = f"wss://s-usc1c-nss-200.firebaseio.com/.ws?v=5&ns=blooket-{server_code}"
@@ -84,47 +146,12 @@ async def _find_socket_url(session: aiohttp.ClientSession, server_code: int) -> 
         pass
     return fallback
 
-async def _get_auth_token(session: aiohttp.ClientSession, pin: str, name: str) -> str:
-    # Check pin is alive
-    check_url = BLOOKET["checkPin"](pin)
-    async with session.get(check_url, headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=10)) as r:
-        alive = await r.json()
-        if not r.ok or not alive.get("success"):
-            raise RuntimeError(alive.get("msg") or "Game not found or not active")
-
-    # Join to get fbToken
-    join_headers = {
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/json",
-        "Referer": "https://www.blooket.com/",
-    }
-    async with session.put(
-        BLOOKET["join"],
-        json={"id": pin, "name": name},
-        headers=join_headers,
-        timeout=aiohttp.ClientTimeout(total=12),
-    ) as r:
-        join_res = await r.json()
-        if not r.ok or not join_res.get("fbToken"):
-            raise RuntimeError(join_res.get("msg") or "Failed to join game")
-
-    # Exchange for Google idToken
-    verify_headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-    async with session.post(
-        BLOOKET["verify"],
-        json={"returnSecureToken": True, "token": join_res["fbToken"]},
-        headers=verify_headers,
-        timeout=aiohttp.ClientTimeout(total=12),
-    ) as r:
-        verify_res = await r.json()
-        if not r.ok or not verify_res.get("idToken"):
-            raise RuntimeError("Failed to verify Blooket token")
-        return verify_res["idToken"]
 
 def _should_answer_from_payload(data: dict) -> bool:
     if not isinstance(data, dict):
         return False
     return any(k in data for k in ("q", "question", "questionText", "answers", "correct"))
+
 
 def _is_game_end_message(msg: dict, raw_text: str) -> bool:
     try:
@@ -145,6 +172,7 @@ def _is_game_end_message(msg: dict, raw_text: str) -> bool:
         return True
     return False
 
+
 async def _blooket_bot(
     session: aiohttp.ClientSession,
     pin: str,
@@ -156,27 +184,21 @@ async def _blooket_bot(
     update_cb(status)
 
     headers = {"User-Agent": USER_AGENT}
-
     ws: Optional[aiohttp.ClientWebSocketResponse] = None
     req_id = 3
     last_answer_at = 0.0
 
     try:
-        # 1. Auth tokens (fb + google)
-        token = await _get_auth_token(session, pin, name)
-
-        # 2. Discover socket shard
+        token = await _get_auth_token(pin, name)
         code = random.choice(SERVER_CODES)
         socket_url = await _find_socket_url(session, code)
 
-        # 3. Connect WS
         ws = await session.ws_connect(
             socket_url,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=15),
         )
 
-        # Send auth + join with random blook
         blook = random_blook()
         await ws.send_str(_authorize_message(token))
         await ws.send_str(_join_message(pin, name, blook))
@@ -186,7 +208,6 @@ async def _blooket_bot(
         status.last_action = f"joined as {blook}"
         update_cb(status)
 
-        # Main message loop
         while not stop_event.is_set():
             try:
                 msg = await asyncio.wait_for(ws.receive(), timeout=1.2)
@@ -219,7 +240,6 @@ async def _blooket_bot(
                     if now - last_answer_at < 0.4:
                         continue
                     last_answer_at = now
-
                     choice = random.randint(0, 3)
                     try:
                         await ws.send_str(_answer_message(pin, name, choice, req_id))
@@ -240,7 +260,6 @@ async def _blooket_bot(
                 update_cb(status)
                 break
 
-        # If we get here without explicit end, mark completed if joined
         if status.status not in ("completed", "failed"):
             status.status = "completed" if status.joined else "failed"
 
@@ -264,6 +283,7 @@ async def _blooket_bot(
         update_cb(status)
 
     return status
+
 
 async def spawn_blooket_bots(pin: str, names: List[str], join_delay_ms: int = 200) -> List[PlayerStatus]:
     results: List[PlayerStatus] = [PlayerStatus(name=n) for n in names]
